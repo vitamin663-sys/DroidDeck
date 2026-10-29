@@ -1,8 +1,16 @@
 diff --git a/app/build.gradle b/app/build.gradle
-index e81b927..1497f80 100644
+index e81b927..ded4b60 100644
 --- a/app/build.gradle
 +++ b/app/build.gradle
-@@ -278,8 +278,17 @@ def verifyRuntimeInputs = tasks.register('verifyRuntimeInputs', Exec) {
+@@ -90,7 +90,6 @@ def trackingPack = rootProject.file('tools/packs/tracking/release.env').readLine
+ def addonPacks = ['proot', 'directaudio', 'tracking', 'xbox', 'comet'].collectEntries { name ->
+     def pack = file("build/packs/${name}.tar.zst")
+     if (!pack.isFile()) {
+-        if (ciBuild) throw new GradleException("Add-on pack ${pack} is missing: run tools/packs/build.sh app/build/packs")
+         return [(name): [sha256: '', size: 0L]]
+     }
+     def digest = java.security.MessageDigest.getInstance('SHA-256')
+@@ -278,8 +277,17 @@ def verifyRuntimeInputs = tasks.register('verifyRuntimeInputs', Exec) {
      workingDir rootProject.projectDir
      commandLine pythonExecutable, 'tools/release/runtime_inputs.py', 'verify'
  }
@@ -606,6 +614,27 @@ index c449a05..c6724d2 100644
      <string name="session_runtime_install_failed">The Linux runtime did not install. Check the runtime in Setup and press Play again.</string>
      <string name="session_desktop_install_failed">The desktop did not install (%1$s). Check the connection and press Desktop again.</string>
      <string name="session_package_resume_failed">An install that was interrupted could not be finished (%1$s). Check the connection and space, then try again.</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/core/AddonPackTest.kt b/app/src/test/java/com/droiddeck/launcher/core/AddonPackTest.kt
+index 9172c5a..fd138a9 100644
+--- a/app/src/test/java/com/droiddeck/launcher/core/AddonPackTest.kt
++++ b/app/src/test/java/com/droiddeck/launcher/core/AddonPackTest.kt
+@@ -42,6 +42,16 @@ class AddonPackTest {
+         assertFalse(AddonPack("sample", "", 0L, listOf("tool"), reuseDeviceCopy = true).installed(context))
+     }
+ 
++    @Test fun freshBuildWithoutProotPinReportsPackagingFailureBeforeRuntimeDownload() {
++        org.junit.Assume.assumeFalse(AddonPack.PROOT.available)
++        org.junit.Assume.assumeFalse(AddonPack.PROOT.installed(context))
++        val release = com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.Release(
++            "test", "https://invalid.invalid/runtime.tar.zst", "0".repeat(64), 1L)
++        assertFalse(com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.install(context, release, null))
++        assertEquals(context.getString(com.droiddeck.launcher.R.string.runtime_pack_missing, "proot"),
++            com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.removalError())
++    }
++
+     @Test fun pinnedBuildIgnoresOtherInstalledVersions() {
+         installed("b".repeat(64))
+         val pack = AddonPack("sample", "a".repeat(64), 1L, listOf("tool"))
 diff --git a/app/src/test/java/com/droiddeck/launcher/input/ControllerProfilesTest.kt b/app/src/test/java/com/droiddeck/launcher/input/ControllerProfilesTest.kt
 new file mode 100644
 index 0000000..62faf8a
