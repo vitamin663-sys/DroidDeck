@@ -46,7 +46,10 @@ jobs:
           GITHUB_ACTIONS: 'false'
         run: ./gradlew -PskipRust=true :app:testDebugUnitTest --tests '*ControllerProfilesTest' --tests '*JoyConPadTest' --tests '*PadBridgeRoutingTest' --tests '*PadPartialAxesTest' --tests '*AddonPackTest'
       - name: Build all runtime inputs, packs and APK
-        run: bash tools/build_local.sh
+        run: |
+          docker pull docker.io/library/debian:bullseye
+          docker tag docker.io/library/debian:bullseye public.ecr.aws/docker/library/debian:bullseye
+          bash tools/build_local.sh
       - name: Verify bundled packs and APK
         run: |
           python3 tools/release/runtime_inputs.py apk app/build/outputs/apk/debug/app-debug.apk
