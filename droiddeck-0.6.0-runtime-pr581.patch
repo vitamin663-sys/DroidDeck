@@ -1,0 +1,802 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index e81b927..1497f80 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -278,8 +278,17 @@ def verifyRuntimeInputs = tasks.register('verifyRuntimeInputs', Exec) {
+     workingDir rootProject.projectDir
+     commandLine pythonExecutable, 'tools/release/runtime_inputs.py', 'verify'
+ }
++
++def verifyAddonPacks = tasks.register('verifyAddonPacks') {
++    doLast {
++        def missing = addonPacks.findAll { name, pack -> !pack.sha256 || pack.size <= 0L }.keySet()
++        if (!missing.isEmpty()) {
++            throw new GradleException("Cannot package an APK without downloadable add-on pack pins: ${missing.join(', ')}. Prepare tools/packs/build.sh app/build/packs, publish matching packs, then rebuild. A fresh installation cannot reuse another app's private packs.")
++        }
++    }
++}
+ tasks.configureEach { task ->
+-    if (task.name in ['packageDebug', 'packageRelease']) task.dependsOn(verifyRuntimeInputs)
++    if (task.name in ['packageDebug', 'packageRelease']) task.dependsOn(verifyRuntimeInputs, verifyAddonPacks)
+ }
+ 
+ def rustCrateDir = layout.projectDirectory.dir('src/main/rust/stores')
+diff --git a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+index 1081cb8..203ee8f 100644
+--- a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+@@ -1090,6 +1090,7 @@ class FrontEndActivity : ComponentActivity() {
+                             onStickClick = { on -> ControllerPrefs.setStickClick(this, on); refreshController() },
+                             onAdaptiveSticks = { on -> ControllerPrefs.setAdaptiveSticks(this, on); refreshController() },
+                             onRumble = { on -> ControllerPrefs.setRumble(this, on); refreshController() },
++                            onDeadZone = { v -> ControllerPrefs.setDeadZone(this, v); refreshController() },
+                             onSteamButton = { on -> ControllerPrefs.setSteamButton(this, on); refreshController() },
+                             onQamButton = { on -> ControllerPrefs.setQamButton(this, on); refreshController() },
+                             onKeyboardButton = { on -> ControllerPrefs.setKeyboardButton(this, on); refreshController() },
+@@ -1098,6 +1099,12 @@ class FrontEndActivity : ComponentActivity() {
+                             onEditLayout = { startActivity(Intent(this, ControllerEditorActivity::class.java)) },
+                             onResetLayout = { ControllerPrefs.resetAllLayouts(this); refreshController() },
+                             onMapping = { showPerformance = false; showComponents = false; showMapping = true },
++                            onExportReport = {
++                                val message = if (!com.droiddeck.launcher.input.PadBridge.anyControllerConnected()) getString(R.string.ctrl_report_none)
++                                else com.droiddeck.launcher.input.ControllerProfiles.exportReport(this)
++                                    ?.let { getString(R.string.ctrl_report_saved, it.path) } ?: getString(R.string.ctrl_report_failed)
++                                android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
++                            },
+                             onResetAll = { ControllerPrefs.resetAll(this); refreshController() },
+                         ),
+                     ),
+@@ -2055,7 +2062,24 @@ class FrontEndActivity : ComponentActivity() {
+             return
+         }
+         if (release == null) {
+-            Thread({ checkCatalog() }, "catalog").start()
++            busy = true
++            failed = false
++            stage = getString(R.string.runtime_catalog_checking)
++            percent = -1
++            Thread({
++                val fetched = LinuxRuntimeInstaller.fetchRelease()
++                Log.i(TAG, "runtime install catalog: " + (fetched?.version ?: "unreachable"))
++                ui.post {
++                    busy = false
++                    if (fetched == null) {
++                        failed = true
++                        android.widget.Toast.makeText(this, R.string.runtime_catalog_failed, android.widget.Toast.LENGTH_LONG).show()
++                    } else {
++                        available = fetched
++                        onRuntimeButton()
++                    }
++                }
++            }, "runtime-install-catalog").start()
+             return
+         }
+         if (installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()) { showNonAdreno = release; return }
+diff --git a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+index 6de07a0..2bcff9e 100644
+--- a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+@@ -2749,6 +2749,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
+         if (!PadBridge.isFromController(d)) return
+         Log.i(TAG, String.format(java.util.Locale.ROOT, "controller %s: \"%s\" (%04x:%04x, id %d, sources 0x%x)",
+             what, d.name, d.vendorId, d.productId, d.id, d.sources))
++        if (what == "connected") Log.i(TAG, "controller \"${d.name}\" reports ${com.droiddeck.launcher.input.ControllerProfiles.describe(d)}")
+     }
+ 
+     private fun steamTouch(): com.droiddeck.launcher.input.SteamTouchControls? {
+@@ -3002,6 +3003,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
+         joyConVr?.refresh()
+         onScreenControls?.reload()
+         controllerSettings = ControllerPrefs.read(this)
++        com.droiddeck.launcher.input.ControllerProfiles.reload(this)
++        if (PadBridge.anyControllerConnected()) Thread { com.droiddeck.launcher.input.ControllerProfiles.exportReport(this) }.start()
+         resumed = true
+         updatePointerCapture()
+         if (!pipUi) sessionClipboard.start()
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/AddonPack.kt b/app/src/main/java/com/droiddeck/launcher/core/AddonPack.kt
+index d54a5ff..cb3dbf1 100644
+--- a/app/src/main/java/com/droiddeck/launcher/core/AddonPack.kt
++++ b/app/src/main/java/com/droiddeck/launcher/core/AddonPack.kt
+@@ -104,7 +104,15 @@ internal class AddonPack(
+         }
+         val root = root(context).apply { mkdirs() }
+         val archive = File(root, "$sha256.tar.zst")
+-        val downloaded = urls.any { url ->
++        val bundled = context.assets.list("addon-packs").orEmpty().contains("$name.tar.zst")
++        val downloaded = if (bundled) {
++            context.assets.open("addon-packs/$name.tar.zst").use { input ->
++                archive.outputStream().use { output -> input.copyTo(output) }
++            }
++            (Hashes.sha256(archive).equals(sha256, ignoreCase = true)).also {
++                if (!it) archive.delete()
++            }
++        } else urls.any { url ->
+             Downloader.downloadFile(url, archive, true, sha256) { p -> mutableState.value = State.Downloading(p.coerceIn(0f, 1f)) }
+                 .also { if (!it) archive.delete() }
+         }
+diff --git a/app/src/main/java/com/droiddeck/launcher/input/ControllerPrefs.kt b/app/src/main/java/com/droiddeck/launcher/input/ControllerPrefs.kt
+index 9b08fd8..12307ec 100644
+--- a/app/src/main/java/com/droiddeck/launcher/input/ControllerPrefs.kt
++++ b/app/src/main/java/com/droiddeck/launcher/input/ControllerPrefs.kt
+@@ -22,6 +22,10 @@ object ControllerPrefs {
+ 
+     val sizes = listOf(80, 90, 100, 110, 125)
+ 
++    /** Percent of a physical stick's travel it must pass before the game sees it. */
++    val deadZones = listOf(0, 5, 8, 12, 15, 20, 25)
++    const val DEFAULT_DEAD_ZONE_PERCENT = 12
++
+     val mappable = listOf(
+         "a" to R.string.ctrl_button_a, "b" to R.string.ctrl_button_b, "x" to R.string.ctrl_button_x, "y" to R.string.ctrl_button_y,
+         "lb" to R.string.ctrl_button_lb, "rb" to R.string.ctrl_button_rb, "lt" to R.string.ctrl_button_lt, "rt" to R.string.ctrl_button_rt,
+@@ -51,6 +55,7 @@ object ControllerPrefs {
+         val snap: Boolean,
+         val customLayout: Boolean,
+         val mapping: Map<String, String>,
++        val deadZone: Int,
+     )
+ 
+     internal fun prefs(context: Context) = context.getSharedPreferences("controller", Context.MODE_PRIVATE)
+@@ -72,6 +77,7 @@ object ControllerPrefs {
+             snap = p.getBoolean("snap", true),
+             customLayout = p.all.keys.any { it.startsWith("layout.") },
+             mapping = mappable.associate { (id, _) -> id to target(context, id) },
++            deadZone = deadZone(context),
+         )
+     }
+ 
+@@ -107,6 +113,13 @@ object ControllerPrefs {
+         prefs(context).edit().putBoolean("adaptiveSticks", on).apply()
+     }
+ 
++    fun deadZone(context: Context): Int =
++        prefs(context).getInt("deadZone", DEFAULT_DEAD_ZONE_PERCENT).takeIf { it in deadZones } ?: DEFAULT_DEAD_ZONE_PERCENT
++
++    fun setDeadZone(context: Context, percent: Int) {
++        prefs(context).edit().putInt("deadZone", percent).apply()
++    }
++
+     fun rumbleEnabled(context: Context): Boolean = prefs(context).getBoolean("rumble", true)
+ 
+     fun setRumble(context: Context, on: Boolean) {
+diff --git a/app/src/main/java/com/droiddeck/launcher/input/ControllerProfiles.kt b/app/src/main/java/com/droiddeck/launcher/input/ControllerProfiles.kt
+new file mode 100644
+index 0000000..ab3f8f8
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/input/ControllerProfiles.kt
+@@ -0,0 +1,244 @@
++package com.droiddeck.launcher.input
++
++import android.content.Context
++import android.os.Environment
++import android.view.InputDevice
++import android.view.KeyEvent
++import android.view.MotionEvent
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++import java.util.Locale
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * How one kind of physical controller is treated: its stick dead zone and any key it reports under
++ * another name. It matches by USB/Bluetooth vendor and product id, by a piece of the device name,
++ * or both; a profile that names neither matches nothing, so a typo cannot catch every pad.
++ *
++ * Anything a profile leaves out follows the global setting (Setup › Controller).
++ */
++class ControllerProfile(
++    val name: String,
++    val vendorId: Int = ANY,
++    val productId: Int = ANY,
++    val nameContains: String? = null,
++    /** 0..[ControllerProfiles.MAX_DEAD_ZONE] of the stick's travel, or null for the global setting. */
++    val deadZone: Float? = null,
++    /** Android key code the pad reports → the key code it is treated as. */
++    val keyMap: Map<Int, Int> = emptyMap(),
++) {
++    private val hasIds get() = vendorId != ANY || productId != ANY
++    private val hasName get() = !nameContains.isNullOrBlank()
++
++    /** 0 when this profile does not match the device; higher is more specific. */
++    fun specificity(vendor: Int, product: Int, deviceName: String?): Int {
++        if (!hasIds && !hasName) return 0
++        if (vendorId != ANY && vendorId != vendor) return 0
++        if (productId != ANY && productId != product) return 0
++        if (hasName && deviceName?.contains(nameContains!!, ignoreCase = true) != true) return 0
++        return (if (hasIds) 2 else 0) + (if (hasName) 1 else 0)
++    }
++
++    companion object {
++        const val ANY = -1
++    }
++}
++
++/** A device's profile folded into what the input path reads per event. */
++class ResolvedController(val profile: ControllerProfile?, val deadZone: Float, private val keyMap: Map<Int, Int>) {
++    fun key(keyCode: Int): Int = keyMap[keyCode] ?: keyCode
++}
++
++/**
++ * The profiles in force, and the lookup the pad bridge makes for each controller.
++ *
++ * Profiles are read from two files, the first match winning, so a person can share one by dropping
++ * it in Downloads: `Download/droiddeck-controller-profiles.json`, then
++ * `files/controller-profiles.json` in the app's data folder. The format is
++ *
++ *     {"profiles": [{"name": "My pad", "vendor": "0x045e", "product": "0x028e",
++ *                    "nameContains": "pad", "deadZone": 0.06,
++ *                    "keys": {"BUTTON_MODE": "BUTTON_SELECT"}}]}
++ *
++ * Every field but `name` is optional. The log prints a ready-made entry when a controller connects.
++ */
++object ControllerProfiles {
++    const val FILE_NAME = "controller-profiles.json"
++    const val DOWNLOAD_NAME = "droiddeck-controller-profiles.json"
++    const val REPORT_NAME = "droiddeck-controller-report.txt"
++    const val DEFAULT_DEAD_ZONE = 0.12f
++    const val MAX_DEAD_ZONE = 0.5f
++
++    @Volatile private var profiles: List<ControllerProfile> = emptyList()
++    @Volatile private var globalDeadZone = DEFAULT_DEAD_ZONE
++    private val cache = ConcurrentHashMap<Int, ResolvedController>()
++    private val plain get() = ResolvedController(null, globalDeadZone, emptyMap())
++
++    /** Reads the global dead zone and the profile files again; the next event of each pad sees them. */
++    @JvmStatic fun reload(context: Context) {
++        globalDeadZone = ControllerPrefs.deadZone(context) / 100f
++        profiles = runCatching { loadFiles(context) }.getOrDefault(emptyList())
++        cache.clear()
++    }
++
++    /** A stick within [deadZone] of its centre, as a circle: reads as centred on both axes. */
++    @JvmStatic fun inDeadZone(x: Float, y: Float, deadZone: Float): Boolean = x * x + y * y < deadZone * deadZone
++
++    @JvmStatic fun forget(deviceId: Int) {
++        cache.remove(deviceId)
++    }
++
++    /** The treatment for this controller; one map lookup per event after the first. */
++    @JvmStatic fun resolve(device: InputDevice?): ResolvedController {
++        if (device == null) return plain
++        cache[device.id]?.let { return it }
++        val found = find(profiles, device.vendorId, device.productId, device.name)
++        val resolved = ResolvedController(found, found?.deadZone ?: globalDeadZone, found?.keyMap.orEmpty())
++        cache[device.id] = resolved
++        return resolved
++    }
++
++    /** The most specific profile that matches; the earlier one on a tie. */
++    fun find(list: List<ControllerProfile>, vendor: Int, product: Int, deviceName: String?): ControllerProfile? {
++        var best: ControllerProfile? = null
++        var bestScore = 0
++        for (profile in list) {
++            val score = profile.specificity(vendor, product, deviceName)
++            if (score > bestScore) {
++                best = profile
++                bestScore = score
++            }
++        }
++        return best
++    }
++
++    private fun loadFiles(context: Context): List<ControllerProfile> {
++        val shared = File(Environment.getExternalStorageDirectory(), "Download/$DOWNLOAD_NAME")
++        val own = File(context.filesDir, FILE_NAME)
++        return listOf(shared, own).filter { it.isFile }.flatMap { file ->
++            runCatching { parse(file.readText()) }.getOrDefault(emptyList())
++        }
++    }
++
++    /** Tolerant: a malformed entry is skipped, a malformed file is empty. */
++    fun parse(text: String): List<ControllerProfile> {
++        val array = runCatching {
++            val trimmed = text.trim()
++            if (trimmed.startsWith("[")) JSONArray(trimmed) else JSONObject(trimmed).optJSONArray("profiles")
++        }.getOrNull() ?: return emptyList()
++        return (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let(::parseEntry) }
++    }
++
++    private fun parseEntry(o: JSONObject): ControllerProfile? {
++        val name = o.optString("name").trim().ifEmpty { return null }
++        val keys = o.optJSONObject("keys")
++        val keyMap = HashMap<Int, Int>()
++        if (keys != null) {
++            for (from in keys.keys()) {
++                val a = keyCode(from)
++                val b = keyCode(keys.optString(from))
++                if (a != KeyEvent.KEYCODE_UNKNOWN && b != KeyEvent.KEYCODE_UNKNOWN) keyMap[a] = b
++            }
++        }
++        val deadZone = if (o.has("deadZone")) o.optDouble("deadZone", Double.NaN).takeIf { !it.isNaN() }
++            ?.toFloat()?.coerceIn(0f, MAX_DEAD_ZONE) else null
++        return ControllerProfile(
++            name = name,
++            vendorId = id(o.opt("vendor")),
++            productId = id(o.opt("product")),
++            nameContains = o.optString("nameContains").trim().ifEmpty { null },
++            deadZone = deadZone,
++            keyMap = keyMap,
++        )
++    }
++
++    /** "0x045e", "1118" or 1118; anything else is "any". */
++    private fun id(value: Any?): Int {
++        val parsed: Int? = when (value) {
++            is Number -> value.toInt()
++            is String -> value.trim().let { s ->
++                if (s.startsWith("0x", ignoreCase = true)) s.substring(2).toIntOrNull(16) else s.toIntOrNull()
++            }
++            else -> null
++        }
++        return parsed?.takeIf { it >= 0 } ?: ControllerProfile.ANY
++    }
++
++    /** "BUTTON_MODE", "KEYCODE_BUTTON_MODE" or a number. */
++    private fun keyCode(name: String): Int {
++        val s = name.trim().uppercase(Locale.ROOT)
++        return s.toIntOrNull()
++            ?: KeyEvent.keyCodeFromString(if (s.startsWith("KEYCODE_")) s else "KEYCODE_$s")
++    }
++
++    fun toJson(list: List<ControllerProfile>): String {
++        val array = JSONArray()
++        for (p in list) {
++            val o = JSONObject().put("name", p.name)
++            if (p.vendorId != ControllerProfile.ANY) o.put("vendor", hex(p.vendorId))
++            if (p.productId != ControllerProfile.ANY) o.put("product", hex(p.productId))
++            p.nameContains?.let { o.put("nameContains", it) }
++            p.deadZone?.let { o.put("deadZone", it.toString().toDouble()) }
++            if (p.keyMap.isNotEmpty()) {
++                val keys = JSONObject()
++                for ((a, b) in p.keyMap) keys.put(KeyEvent.keyCodeToString(a).removePrefix("KEYCODE_"), KeyEvent.keyCodeToString(b).removePrefix("KEYCODE_"))
++                o.put("keys", keys)
++            }
++            array.put(o)
++        }
++        return JSONObject().put("profiles", array).toString(2)
++    }
++
++    private fun hex(v: Int) = String.format(Locale.ROOT, "0x%04x", v)
++
++    private val reportedKeys = intArrayOf(
++        KeyEvent.KEYCODE_BUTTON_MODE, KeyEvent.KEYCODE_HOME, KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_MENU,
++        KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_BUTTON_THUMBL, KeyEvent.KEYCODE_BUTTON_THUMBR,
++    )
++
++    /**
++     * What a controller reports, for the log: the buttons it declares and each axis's range, flat
++     * (the dead zone the pad itself asks for) and fuzz, then an entry to start a profile from. A
++     * report with this in it is enough to write a profile for a pad nobody here owns.
++     */
++    @JvmStatic fun describe(device: InputDevice): String {
++        val has = device.hasKeys(*reportedKeys)
++        val keys = reportedKeys.indices.filter { has[it] }.joinToString(",") { KeyEvent.keyCodeToString(reportedKeys[it]).removePrefix("KEYCODE_") }
++        val axes = device.motionRanges.joinToString("; ") { r ->
++            String.format(Locale.ROOT, "%s[%.2f..%.2f flat %.3f fuzz %.3f]", MotionEvent.axisToString(r.axis).removePrefix("AXIS_"), r.min, r.max, r.flat, r.fuzz)
++        }
++        val template = toJson(listOf(ControllerProfile(device.name, device.vendorId, device.productId, deadZone = DEFAULT_DEAD_ZONE)))
++            .replace(Regex("\\s+"), " ")
++        return "keys [$keys]; axes [$axes]; profile entry $template"
++    }
++
++    /**
++     * Writes what every connected controller reports to `Download/droiddeck-controller-report.txt`,
++     * to hand over when a pad misbehaves or to start a profile from. It holds the controllers'
++     * names (a Bluetooth pad can carry a name its owner gave it), the phone model and the app
++     * version, and nothing else about the person. Returns the file, or null when nothing was written.
++     */
++    @JvmStatic fun exportReport(context: Context): File? = runCatching {
++        reload(context)
++        val b = StringBuilder("DroidDeck controller report\n===========================\n")
++        b.append("Written     ").append(java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss zzz", Locale.US).format(java.util.Date())).append('\n')
++        b.append("App         ").append(runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()).append('\n')
++        b.append("Phone       ").append(android.os.Build.MANUFACTURER).append(' ').append(android.os.Build.MODEL)
++            .append(", Android ").append(android.os.Build.VERSION.RELEASE).append('\n')
++        b.append("Dead zone   ").append(Math.round(globalDeadZone * 100)).append(" % (setting); ").append(profiles.size).append(" profile(s) loaded\n")
++        val pads = InputDevice.getDeviceIds().toList().mapNotNull { InputDevice.getDevice(it) }.filter { PadBridge.isFromController(it) }
++        if (pads.isEmpty()) b.append("\nNo controller is connected.\n")
++        for (d in pads) {
++            val r = resolve(d)
++            b.append("\nController  ").append(d.name).append('\n')
++            b.append(String.format(Locale.ROOT, "Ids         %04x:%04x, sources 0x%x\n", d.vendorId, d.productId, d.sources))
++            b.append("Profile     ").append(r.profile?.name ?: "none (the global dead zone applies)").append('\n')
++            b.append("Reports     ").append(describe(d)).append('\n')
++        }
++        val target = File(Environment.getExternalStorageDirectory(), "Download/$REPORT_NAME")
++        target.parentFile?.mkdirs()
++        target.writeText(b.toString())
++        target
++    }.getOrNull()
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/input/PadBridge.java b/app/src/main/java/com/droiddeck/launcher/input/PadBridge.java
+index cfb0978..d6d6688 100644
+--- a/app/src/main/java/com/droiddeck/launcher/input/PadBridge.java
++++ b/app/src/main/java/com/droiddeck/launcher/input/PadBridge.java
+@@ -16,7 +16,6 @@ import java.util.concurrent.atomic.AtomicIntegerArray;
+ public final class PadBridge {
+     private static final String TAG = "PadBridge";
+     public static final int SLOTS = 4;
+-    private static final float DEAD_ZONE = 0.12f;
+     private static final int[] JOYSTICK_AXES = {
+             MotionEvent.AXIS_X, MotionEvent.AXIS_Y, MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ,
+             MotionEvent.AXIS_RX, MotionEvent.AXIS_RY,
+@@ -289,7 +288,8 @@ public final class PadBridge {
+         if (side >= 0 && partners[slot] != NO_CONTROLLER && JoyCon.isRail(side, event.getScanCode())) return true;
+         PadState pad = stateFor(slot);
+         boolean pressed = event.getAction() == KeyEvent.ACTION_DOWN;
+-        switch (event.getKeyCode()) {
++        // A profile can have a pad's button count as another (ControllerProfiles).
++        switch (ControllerProfiles.resolve(event.getDevice()).key(event.getKeyCode())) {
+             case KeyEvent.KEYCODE_BUTTON_A: pad.press(0, pressed); break;
+             case KeyEvent.KEYCODE_BUTTON_B: pad.press(1, pressed); break;
+             case KeyEvent.KEYCODE_BUTTON_X: pad.press(2, pressed); break;
+@@ -338,12 +338,13 @@ public final class PadBridge {
+         noteDevice(event.getDevice(), slot);
+         statAxes++;
+         scheduleStats();
++        float deadZone = ControllerProfiles.resolve(event.getDevice()).getDeadZone();
+         InputDevice device = event.getDevice();
+         int side = JoyCon.side(device);
+         if (side >= 0) {
+             int[] stick = JoyCon.stickAxes(side, device, event.getSource());
+-            float x = axis(event, stick[0]);
+-            float y = axis(event, stick[1]);
++            float x = axis(event, stick[0], deadZone);
++            float y = axis(event, stick[1], deadZone);
+             if (side == JoyCon.LEFT) {
+                 pad.leftX = x;
+                 pad.leftY = y;
+@@ -355,11 +356,21 @@ public final class PadBridge {
+             publish(slot);
+             return true;
+         }
+-        pad.leftX = axis(event, MotionEvent.AXIS_X);
+-        pad.leftY = axis(event, MotionEvent.AXIS_Y);
++        // Each stick's dead zone is a circle round its centre, so a stick held well over to one
++        // side still answers small movements on the other axis.
++        float lx = event.getAxisValue(MotionEvent.AXIS_X);
++        // Android's Y axis grows downwards and evdev's ABS_Y does too, so no flip here: what the
++        // pad reports as "down" is what the client is told.
++        float ly = event.getAxisValue(MotionEvent.AXIS_Y);
+         boolean wired = wiredXboxLayout(event);
+-        pad.rightX = rightX(event, wired);
+-        pad.rightY = rightY(event, wired);
++        float rx = rightX(event, wired);
++        float ry = rightY(event, wired);
++        boolean leftCentred = ControllerProfiles.inDeadZone(lx, ly, deadZone);
++        boolean rightCentred = ControllerProfiles.inDeadZone(rx, ry, deadZone);
++        pad.leftX = leftCentred ? 0f : lx;
++        pad.leftY = leftCentred ? 0f : ly;
++        pad.rightX = rightCentred ? 0f : rx;
++        pad.rightY = rightCentred ? 0f : ry;
+         int source = event.getSource();
+         float lt = 0f;
+         float rt = 0f;
+@@ -469,6 +480,7 @@ public final class PadBridge {
+     }
+ 
+     public synchronized void onDeviceRemoved(int deviceId) {
++        ControllerProfiles.forget(deviceId);
+         for (int slot = 0; slot < SLOTS; slot++) {
+             if (owners[slot] == deviceId || partners[slot] == deviceId) leave(slot, deviceId);
+         }
+@@ -634,6 +646,9 @@ public final class PadBridge {
+             Log.i(TAG, String.format(java.util.Locale.ROOT, "first input from \"%s\" (%04x:%04x, id %d, sources 0x%x); slot %d, ring %s, deck pad %b",
+                     device.getName(), device.getVendorId(), device.getProductId(), device.getId(), device.getSources(),
+                     slot, open ? "open" : "not open yet", SessionState.getDeckPad()));
++            ControllerProfile profile = ControllerProfiles.resolve(device).getProfile();
++            Log.i(TAG, profile != null ? "profile \"" + profile.getName() + "\" applies to \"" + device.getName() + "\""
++                    : "no profile for \"" + device.getName() + "\"; global dead zone");
+         }
+     }
+ 
+@@ -701,11 +716,11 @@ public final class PadBridge {
+     }
+ 
+     public static float rightX(MotionEvent event, boolean wired) {
+-        return axis(event, wired ? MotionEvent.AXIS_RX : MotionEvent.AXIS_Z);
++        return event.getAxisValue(wired ? MotionEvent.AXIS_RX : MotionEvent.AXIS_Z);
+     }
+ 
+     public static float rightY(MotionEvent event, boolean wired) {
+-        return axis(event, wired ? MotionEvent.AXIS_RY : MotionEvent.AXIS_RZ);
++        return event.getAxisValue(wired ? MotionEvent.AXIS_RY : MotionEvent.AXIS_RZ);
+     }
+ 
+     public static float leftTrigger(MotionEvent event, boolean wired) {
+@@ -720,8 +735,8 @@ public final class PadBridge {
+         return value != 0f ? value : event.getAxisValue(MotionEvent.AXIS_GAS);
+     }
+ 
+-    private static float axis(MotionEvent event, int axis) {
++    private static float axis(MotionEvent event, int axis, float deadZone) {
+         float value = event.getAxisValue(axis);
+-        return Math.abs(value) < DEAD_ZONE ? 0f : value;
++        return Math.abs(value) < deadZone ? 0f : value;
+     }
+ }
+diff --git a/app/src/main/java/com/droiddeck/launcher/runtime/LinuxRuntimeInstaller.java b/app/src/main/java/com/droiddeck/launcher/runtime/LinuxRuntimeInstaller.java
+index d6f6b00..b59ea63 100644
+--- a/app/src/main/java/com/droiddeck/launcher/runtime/LinuxRuntimeInstaller.java
++++ b/app/src/main/java/com/droiddeck/launcher/runtime/LinuxRuntimeInstaller.java
+@@ -255,6 +255,13 @@ public final class LinuxRuntimeInstaller {
+         // reached verification and failed is not trusted and is removed.
+         boolean keepPartial = false;
+         try {
++            for (AddonPack pack : new AddonPack[]{AddonPack.PROOT, AddonPack.DIRECTAUDIO}) {
++                if (!pack.getAvailable() && !pack.installed(context)) {
++                    removalError = context.getString(R.string.runtime_pack_missing, pack.getName());
++                    Log.e(TAG, removalError);
++                    return false;
++                }
++            }
+             deleteOtherArchives(context.getCacheDir(), archive.getName());
+             File pendingRemoval = removalDirectory(LinuxRuntime.rootDir(context));
+             if (pendingRemoval.exists() && listener != null) listener.onProgress(context.getString(R.string.rtinst_removing_leftovers), -1);
+diff --git a/app/src/main/java/com/droiddeck/launcher/ui/ControllerSettings.kt b/app/src/main/java/com/droiddeck/launcher/ui/ControllerSettings.kt
+index ff39fb0..982fb28 100644
+--- a/app/src/main/java/com/droiddeck/launcher/ui/ControllerSettings.kt
++++ b/app/src/main/java/com/droiddeck/launcher/ui/ControllerSettings.kt
+@@ -25,6 +25,7 @@ class ControllerActions(
+     val onStickClick: (Boolean) -> Unit,
+     val onAdaptiveSticks: (Boolean) -> Unit,
+     val onRumble: (Boolean) -> Unit,
++    val onDeadZone: (Int) -> Unit,
+     val onSteamButton: (Boolean) -> Unit,
+     val onQamButton: (Boolean) -> Unit,
+     val onKeyboardButton: (Boolean) -> Unit,
+@@ -33,6 +34,7 @@ class ControllerActions(
+     val onEditLayout: () -> Unit,
+     val onResetLayout: () -> Unit,
+     val onMapping: () -> Unit,
++    val onExportReport: () -> Unit,
+     val onResetAll: () -> Unit,
+ )
+ 
+@@ -69,6 +71,7 @@ fun ColumnScope.ControllerRows(host: MenuHost, oscMode: String, c: ControllerPre
+     ToggleRow(host, "controller-stick-click", stringResource(R.string.ctrl_stick_click), stringResource(R.string.ctrl_stick_click_hint), c.stickClick, onChange = a.onStickClick)
+     ToggleRow(host, "controller-adaptive", stringResource(R.string.ctrl_adaptive), stringResource(R.string.ctrl_adaptive_hint), c.adaptiveSticks, onChange = a.onAdaptiveSticks)
+     ToggleRow(host, "controller-rumble", stringResource(R.string.ctrl_rumble), null, c.rumble, onChange = a.onRumble)
++    ChoiceRow(host, "controller-dead-zone", stringResource(R.string.ctrl_dead_zone), stringResource(R.string.ctrl_dead_zone_hint), ControllerPrefs.deadZones.map { it to stringResource(R.string.ctrl_percent, it) }, c.deadZone, onPick = a.onDeadZone)
+     ToggleRow(host, "controller-steam", stringResource(R.string.ctrl_steam_button), null, c.steamButton, onChange = a.onSteamButton)
+     ToggleRow(host, "controller-qam", stringResource(R.string.ctrl_qam_button), null, c.qamButton, onChange = a.onQamButton)
+     ToggleRow(host, "controller-keyboard", stringResource(R.string.ctrl_keyboard_button), null, c.keyboardButton, onChange = a.onKeyboardButton)
+@@ -82,6 +85,7 @@ fun ColumnScope.ControllerRows(host: MenuHost, oscMode: String, c: ControllerPre
+     }
+     val remapped = c.mapping.count { (id, target) -> id != target }
+     ActionRow(stringResource(R.string.ctrl_mapping), if (remapped == 0) stringResource(R.string.ctrl_mapping_default) else stringResource(R.string.ctrl_mapping_count, remapped, c.mapping.size), stringResource(R.string.ctrl_configure), a.onMapping)
++    ActionRow(stringResource(R.string.ctrl_report), stringResource(R.string.ctrl_report_hint), stringResource(R.string.ctrl_report_export), a.onExportReport)
+     ActionRow(stringResource(R.string.ctrl_reset_all), stringResource(R.string.ctrl_reset_all_hint), stringResource(R.string.ctrl_reset), a.onResetAll)
+ }
+ 
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c449a05..c6724d2 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -998,6 +998,8 @@
+     <string name="ctrl_stick_click_hint">Double-tap and hold a stick for L3 or R3</string>
+     <string name="ctrl_adaptive">Adaptive sticks</string>
+     <string name="ctrl_rumble">Game vibration</string>
++    <string name="ctrl_dead_zone">Stick dead zone</string>
++    <string name="ctrl_dead_zone_hint">How far a controller stick must move before a game sees it. Lower it if sticks feel sluggish, raise it if they drift</string>
+     <string name="ctrl_steam_button">Steam button</string>
+     <string name="ctrl_qam_button">QAM button</string>
+     <string name="ctrl_keyboard_button">Keyboard button</string>
+@@ -1016,6 +1018,12 @@
+     <string name="ctrl_mapping_default">Every button sends its own input</string>
+     <string name="ctrl_mapping_count">%1$d of %2$d buttons remapped</string>
+     <string name="ctrl_configure">Configure</string>
++    <string name="ctrl_report">Controller report</string>
++    <string name="ctrl_report_hint">Saves what the connected controllers report to Downloads, to share when one misbehaves</string>
++    <string name="ctrl_report_export">Export</string>
++    <string name="ctrl_report_saved">Saved to %1$s</string>
++    <string name="ctrl_report_none">No controller is connected</string>
++    <string name="ctrl_report_failed">Could not write the report</string>
+     <string name="ctrl_reset_all">Reset controller</string>
+     <string name="ctrl_reset_all_hint">Restores all controller settings and the layout</string>
+     <string name="ctrl_mapping_lede">What each on-screen button sends to the game. Hidden removes the button.</string>
+@@ -1402,6 +1410,9 @@
+     <string name="session_proton_checking">checking Proton Experimental (ARM64)</string>
+     <string name="session_proton_unpacking">unpacking Proton Experimental (ARM64)</string>
+     <string name="session_runtime_catalog_unreachable">Could not reach the runtime catalog. Check the connection and press Play again.</string>
++    <string name="runtime_catalog_checking">Checking the Linux runtime download…</string>
++    <string name="runtime_catalog_failed">Could not load the Linux runtime catalog. Check access to raw.githubusercontent.com, then press Install again.</string>
++    <string name="runtime_pack_missing">This APK has no download information for the required %1$s pack. Install a build with prepared and published add-on packs.</string>
+     <string name="session_runtime_install_failed">The Linux runtime did not install. Check the runtime in Setup and press Play again.</string>
+     <string name="session_desktop_install_failed">The desktop did not install (%1$s). Check the connection and press Desktop again.</string>
+     <string name="session_package_resume_failed">An install that was interrupted could not be finished (%1$s). Check the connection and space, then try again.</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/input/ControllerProfilesTest.kt b/app/src/test/java/com/droiddeck/launcher/input/ControllerProfilesTest.kt
+new file mode 100644
+index 0000000..62faf8a
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/input/ControllerProfilesTest.kt
+@@ -0,0 +1,95 @@
++package com.droiddeck.launcher.input
++
++import android.view.KeyEvent
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++/** Per-controller profiles: what they match, what a file may contain, and what a bad file does. */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33])
++class ControllerProfilesTest {
++    private val json = """
++        {"profiles": [
++          {"name": "By name", "nameContains": "mcon", "deadZone": 0.05},
++          {"name": "By ids", "vendor": "0x045e", "product": 654, "deadZone": 0.2},
++          {"name": "Both", "vendor": "0x045e", "product": "0x028e", "nameContains": "pad",
++           "keys": {"BUTTON_MODE": "KEYCODE_BUTTON_SELECT", "96": "97"}}
++        ]}
++    """.trimIndent()
++
++    @Test fun readsEveryFieldOfAProfile() {
++        val both = ControllerProfiles.parse(json).first { it.name == "Both" }
++        assertEquals(0x045e, both.vendorId)
++        assertEquals(0x028e, both.productId)
++        assertEquals("pad", both.nameContains)
++        assertNull(both.deadZone)
++        assertEquals(KeyEvent.KEYCODE_BUTTON_SELECT, both.keyMap[KeyEvent.KEYCODE_BUTTON_MODE])
++        assertEquals(KeyEvent.KEYCODE_BUTTON_B, both.keyMap[KeyEvent.KEYCODE_BUTTON_A])
++    }
++
++    @Test fun theMostSpecificProfileWins() {
++        val list = ControllerProfiles.parse(json)
++        assertEquals("Both", ControllerProfiles.find(list, 0x045e, 0x028e, "Xbox Pad")?.name)
++        assertEquals("By ids", ControllerProfiles.find(list, 0x045e, 654, "Xbox Controller")?.name)
++        assertEquals("By name", ControllerProfiles.find(list, 1, 2, "MCON Gamepad")?.name)
++        assertNull(ControllerProfiles.find(list, 1, 2, "Some other pad"))
++    }
++
++    @Test fun aProfileThatNamesNothingMatchesNothing() {
++        val list = ControllerProfiles.parse("""[{"name": "Everything", "deadZone": 0.0}]""")
++        assertEquals(1, list.size)
++        assertNull(ControllerProfiles.find(list, 0x045e, 0x028e, "Xbox Pad"))
++    }
++
++    @Test fun anIdNeedsBothHalvesToAgree() {
++        val list = ControllerProfiles.parse("""[{"name": "P", "vendor": "0x045e", "product": "0x028e"}]""")
++        assertNull(ControllerProfiles.find(list, 0x045e, 0x0001, "x"))
++        assertNull(ControllerProfiles.find(list, 0x0001, 0x028e, "x"))
++    }
++
++    @Test fun deadZoneIsKeptInRange() {
++        val list = ControllerProfiles.parse("""[{"name":"a","nameContains":"a","deadZone":5},{"name":"b","nameContains":"b","deadZone":-1}]""")
++        assertEquals(ControllerProfiles.MAX_DEAD_ZONE, list[0].deadZone!!, 0f)
++        assertEquals(0f, list[1].deadZone!!, 0f)
++    }
++
++    @Test fun badEntriesAreSkippedAndBadFilesAreEmpty() {
++        val list = ControllerProfiles.parse("""{"profiles": [{"nameContains": "no name"}, 3, {"name": "ok", "nameContains": "x", "keys": {"NOT_A_KEY": "A"}}]}""")
++        assertEquals(listOf("ok"), list.map { it.name })
++        assertTrue(list[0].keyMap.isEmpty())
++        assertTrue(ControllerProfiles.parse("not json").isEmpty())
++        assertTrue(ControllerProfiles.parse("").isEmpty())
++        assertTrue(ControllerProfiles.parse("""{"other": 1}""").isEmpty())
++    }
++
++    @Test fun resolvedControllerOnlyRemapsWhatItIsTold() {
++        val resolved = ResolvedController(null, 0.1f, mapOf(KeyEvent.KEYCODE_BUTTON_MODE to KeyEvent.KEYCODE_BUTTON_SELECT))
++        assertEquals(KeyEvent.KEYCODE_BUTTON_SELECT, resolved.key(KeyEvent.KEYCODE_BUTTON_MODE))
++        assertEquals(KeyEvent.KEYCODE_BUTTON_A, resolved.key(KeyEvent.KEYCODE_BUTTON_A))
++    }
++
++    @Test fun theDeadZoneIsACircleNotACross() {
++        // Held well over to the right, a small push up still counts.
++        assertEquals(false, ControllerProfiles.inDeadZone(0.5f, 0.05f, 0.12f))
++        assertEquals(true, ControllerProfiles.inDeadZone(0.05f, 0.05f, 0.12f))
++        assertEquals(true, ControllerProfiles.inDeadZone(0.11f, 0f, 0.12f))
++        assertEquals(false, ControllerProfiles.inDeadZone(0.09f, 0.09f, 0.12f))
++        assertEquals(false, ControllerProfiles.inDeadZone(0f, 0f, 0f))
++    }
++
++    @Test fun whatIsWrittenCanBeReadBack() {
++        val original = ControllerProfile("MCON", 0x1234, 0x5678, "mcon", 0.06f, mapOf(KeyEvent.KEYCODE_HOME to KeyEvent.KEYCODE_BUTTON_MODE))
++        val back = ControllerProfiles.parse(ControllerProfiles.toJson(listOf(original))).single()
++        assertEquals("MCON", back.name)
++        assertEquals(0x1234, back.vendorId)
++        assertEquals(0x5678, back.productId)
++        assertEquals("mcon", back.nameContains)
++        assertEquals(0.06f, back.deadZone!!, 0.0001f)
++        assertEquals(original.keyMap, back.keyMap)
++    }
++}
+diff --git a/docs/development/controller-profiles.md b/docs/development/controller-profiles.md
+new file mode 100644
+index 0000000..4d51c42
+--- /dev/null
++++ b/docs/development/controller-profiles.md
+@@ -0,0 +1,70 @@
++# Controller profiles
++
++How a physical controller's stick dead zone and key names are decided. A pad is matched by what
++Android reports about it, so the same settings follow it onto any phone.
++
++## Global dead zone
++
++**Setup › Controller › Stick dead zone** (0, 5, 8, 12, 15, 20 or 25 %, default 12 as before).
++It applies to every physical pad that has no profile. The dead zone is a circle round each stick's
++centre: inside it the stick reads as centred, outside it the value passes through unchanged. (It used
++to be a separate 12 % on each axis, which held back small movements on one axis while the stick was
++pushed over on the other; 0 % now means no dead zone at all.)
++
++## Profiles
++
++A profile is a JSON entry in either file; the first match wins, Downloads before the app's folder:
++
++1. `Download/droiddeck-controller-profiles.json`
++2. `files/controller-profiles.json` in the app's data folder
++
++```json
++{"profiles": [
++  {"name": "My pad", "vendor": "0x045e", "product": "0x028e", "nameContains": "pad",
++   "deadZone": 0.06, "keys": {"BUTTON_MODE": "BUTTON_SELECT"}}
++]}
++```
++
++| Field | Meaning |
++| --- | --- |
++| `name` | Label for the log. Required. |
++| `vendor`, `product` | USB / Bluetooth ids: `"0x045e"`, `"1118"` or a number. |
++| `nameContains` | Part of the device name, any case. |
++| `deadZone` | 0 to 0.5 of the stick's travel. Left out: the global setting. |
++| `keys` | Key the pad reports → key it is treated as (`KEYCODE_` optional, or a number). |
++
++A profile needs `vendor`/`product` or `nameContains`; one with neither matches nothing. When several
++match, the most specific wins (ids and name, then ids, then name), the earlier entry on a tie. The
++file is read when a session opens, so a change shows after the next one.
++
++## Writing one for a pad you have
++
++When a controller connects, the app log (`logcat -s SessionActivity PadBridge`) has a line like
++
++```
++controller "MCON Gamepad" reports keys [BUTTON_MODE,BACK]; axes [X[-1.00..1.00 flat 0.060 fuzz 0.000]; ...];
++profile entry { "profiles": [ { "name": "MCON Gamepad", "vendor": "0x....", "product": "0x....", "deadZone": 0.12 } ] }
++```
++
++Copy the entry, change what is wrong, and save it as one of the files above. `flat` is the dead zone the
++pad itself asks Android for, a good starting point. `PadBridge` then logs `profile "..." applies`
++the first time that pad sends input.
++
++## Exporting the report
++
++**Setup › Controller › Controller report › Export** (and automatically when a session opens with a
++controller connected) writes `Download/droiddeck-controller-report.txt`: the controllers' names and
++ids, the profile each one got, their buttons and axis ranges, a profile entry to start from, plus the
++phone model and app version. A Bluetooth pad can carry a name its owner gave it, so read the file before
++posting it; nothing else about the person is in it.
++
++## Code
++
++`input/ControllerProfiles.kt` (matching, files, parsing, the per-device cache), read per event by
++`PadBridge.onKeyEvent` / `onMotionEvent`. Tests: `ControllerProfilesTest`.
++
++## Not here yet
++
++Per-controller settings beyond dead zone and key names (trigger curves, stick calibration, the touch
++controls hiding, rumble), a profile editor in Setup, sharing profiles in the app, and phone-wide profiles
++(refresh rate, FPS cap, performance mode keyed to the device). See the tracking issue.
+diff --git a/tools/build_local.sh b/tools/build_local.sh
+index a980d70..00437f0 100755
+--- a/tools/build_local.sh
++++ b/tools/build_local.sh
+@@ -386,6 +386,12 @@ if ! restore_step comet "${comet_key}" "${comet_out}"; then
+     save_step comet "${comet_key}" "${comet_out}"
+ fi
+ bash tools/packs/build.sh app/build/packs
++if [[ "${DROIDDECK_BUNDLE_PACKS:-0}" == 1 ]]; then
++    mkdir -p app/src/main/assets/addon-packs
++    for name in proot directaudio tracking xbox comet; do
++        cp "app/build/packs/$name.tar.zst" "app/src/main/assets/addon-packs/$name.tar.zst"
++    done
++fi
+ python3 tools/release/runtime_inputs.py record
+ ./gradlew "${gradle_task}" --console=plain -PndkVersion="${ndk_version}" ${gradle_rust_arg}
+ python3 tools/release/check_session_assets.py "app/build/outputs/apk/${build_variant}/app-${build_variant}.apk"
