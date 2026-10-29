@@ -76,6 +76,7 @@ jobs:
           destination="$DROIDDECK_BUILD_CACHE/steps/xbox/$xbox_key"
           mkdir -p "$destination"
           cp -a native-xbox/. "$destination/"
+          chmod 755 "$destination/xodus-cli" "$destination/xodus-service"
           touch "$destination/.complete"
       - name: Build all runtime inputs, packs and APK
         run: |
@@ -89,11 +90,18 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
           import hashlib
+          import io, subprocess, tarfile
           apk = Path('app/build/outputs/apk/debug/app-debug.apk')
           with ZipFile(apk) as z:
               for name in ['proot', 'directaudio', 'tracking', 'xbox', 'comet']:
                   pack = Path('app/build/packs') / (name + '.tar.zst')
                   assert hashlib.sha256(z.read('assets/addon-packs/' + pack.name)).digest() == hashlib.sha256(pack.read_bytes()).digest(), name
+                  executable_files = {'proot': ['libproot.so', 'libproot-loader.so'], 'xbox': ['xodus-cli', 'xodus-service']}.get(name, [])
+                  if executable_files:
+                      decoded = subprocess.run(['zstd', '-dc', str(pack)], check=True, stdout=subprocess.PIPE).stdout
+                      with tarfile.open(fileobj=io.BytesIO(decoded)) as archive:
+                          for executable in executable_files:
+                              assert archive.getmember(executable).mode & 0o111, executable
           Path('SHA256SUMS.txt').write_text(hashlib.sha256(apk.read_bytes()).hexdigest() + '  app-debug.apk\n')
           PY
       - uses: actions/upload-artifact@v4
