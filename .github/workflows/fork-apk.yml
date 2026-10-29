@@ -7,7 +7,28 @@ on:
 permissions:
   contents: read
 jobs:
+  xbox:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply source patch
+        run: git apply droiddeck-0.6.0-runtime-pr581.patch
+      - name: Build Xbox backend on ARM64
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler cmake xz-utils
+          bash tools/xbox/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xbox-native-arm64
+          path: app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xbox
+          if-no-files-found: error
   apk:
+    needs: xbox
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
@@ -45,6 +66,17 @@ jobs:
         env:
           GITHUB_ACTIONS: 'false'
         run: ./gradlew -PskipRust=true :app:testDebugUnitTest --tests '*ControllerProfilesTest' --tests '*JoyConPadTest' --tests '*PadBridgeRoutingTest' --tests '*PadPartialAxesTest' --tests '*AddonPackTest'
+      - uses: actions/download-artifact@v4
+        with:
+          name: xbox-native-arm64
+          path: native-xbox
+      - name: Prepare verified native Xbox cache
+        run: |
+          xbox_key=$({ printf '%s\n' native-arm64-ubuntu24.04; find tools/xbox -type f ! -name '*.pyc' | LC_ALL=C sort | xargs shasum -a 256; } | shasum -a 256 | cut -d' ' -f1)
+          destination="$DROIDDECK_BUILD_CACHE/steps/xbox/$xbox_key"
+          mkdir -p "$destination"
+          cp -a native-xbox/. "$destination/"
+          touch "$destination/.complete"
       - name: Build all runtime inputs, packs and APK
         run: |
           docker pull docker.io/library/debian:bullseye
