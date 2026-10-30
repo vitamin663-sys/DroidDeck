@@ -33,6 +33,7 @@ jobs:
       DROIDDECK_BUILD_VARIANT: debug
       DROIDDECK_BUNDLE_PACKS: '1'
       DROIDDECK_BUILD_CACHE: ${{ github.workspace }}/build-cache
+      DROIDDECK_PACK_CACHE: ${{ github.workspace }}/pack-input-cache
     steps:
       - uses: actions/checkout@v4
         with:
