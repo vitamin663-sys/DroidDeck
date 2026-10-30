@@ -1,5 +1,5 @@
 name: Verify 0.6.7 stick dead zone
-run-name: Verify 0.6.7 source abdf86d9 and existing features
+run-name: Verify 0.6.7 source f09c4a8f and existing features
 on:
   workflow_dispatch:
 permissions:
@@ -15,12 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: abdf86d96162384e9abb8e07303a8e658c6513a1
+          ref: f09c4a8fd9e90a4a0ba67f3eb9d375e43e9f54b7
           persist-credentials: false
       - name: Verify exact reviewed source
         run: |
-          test "$(git rev-parse HEAD)" = abdf86d96162384e9abb8e07303a8e658c6513a1
-          test "$(git rev-parse 'HEAD^{tree}')" = 0e4f1776f8183b7afb4a8542bb2a4272ed6aba62
+          test "$(git rev-parse HEAD)" = f09c4a8fd9e90a4a0ba67f3eb9d375e43e9f54b7
+          test "$(git rev-parse 'HEAD^{tree}')" = d5c035d5cc42661482d4af673c72dc90acc5466f
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
