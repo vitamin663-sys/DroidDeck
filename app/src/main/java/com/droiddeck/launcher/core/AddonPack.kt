@@ -104,7 +104,15 @@ internal class AddonPack(
         }
         val root = root(context).apply { mkdirs() }
         val archive = File(root, "$sha256.tar.zst")
-        val downloaded = urls.any { url ->
+        val bundled = context.assets.list("addon-packs").orEmpty().contains("$name.tar.zst")
+        val downloaded = if (bundled) {
+            context.assets.open("addon-packs/$name.tar.zst").use { input ->
+                archive.outputStream().use { output -> input.copyTo(output) }
+            }
+            (Hashes.sha256(archive).equals(sha256, ignoreCase = true)).also {
+                if (!it) archive.delete()
+            }
+        } else urls.any { url ->
             Downloader.downloadFile(url, archive, true, sha256) { p -> mutableState.value = State.Downloading(p.coerceIn(0f, 1f)) }
                 .also { if (!it) archive.delete() }
         }

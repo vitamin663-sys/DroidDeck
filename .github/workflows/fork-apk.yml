@@ -1,0 +1,113 @@
+name: Fork APK 0.6.7 PR581
+on:
+  push:
+    branches: [fix/0.6.7-runtime-pr581]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  xbox:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build Xbox backend on ARM64
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler cmake xz-utils
+          bash tools/xbox/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xbox-native-arm64
+          path: app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xbox
+          if-no-files-found: error
+  apk:
+    needs: xbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DROIDDECK_BUILD_VARIANT: debug
+      DROIDDECK_BUNDLE_PACKS: '1'
+      DROIDDECK_BUILD_CACHE: ${{ github.workspace }}/build-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Apply the reviewed 0.6.7 repair
+        run: |
+          printf 'droiddeck.debugApplicationIdSuffix=.pr581\n' > local.properties
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zstd cmake ninja-build curl unzip python3
+          sdkmanager 'platform-tools' 'platforms;android-34' 'build-tools;35.0.0' 'ndk;27.3.13750724' 'cmake;3.22.1'
+      - name: Controller and pack tests
+        env:
+          GITHUB_ACTIONS: 'false'
+        run: ./gradlew -PskipRust=true :app:testDebugUnitTest --tests '*ControllerProfilesTest' --tests '*JoyConPadTest' --tests '*PadBridgeRoutingTest' --tests '*PadPartialAxesTest' --tests '*AddonPackTest'
+      - uses: actions/download-artifact@v4
+        with:
+          name: xbox-native-arm64
+          path: native-xbox
+      - name: Prepare verified native Xbox cache
+        run: |
+          xbox_key=$({ printf '%s\n' native-arm64-ubuntu24.04; find tools/xbox -type f ! -name '*.pyc' | LC_ALL=C sort | xargs shasum -a 256; } | shasum -a 256 | cut -d' ' -f1)
+          destination="$DROIDDECK_BUILD_CACHE/steps/xbox/$xbox_key"
+          mkdir -p "$destination"
+          cp -a native-xbox/. "$destination/"
+          chmod 755 "$destination/xodus-cli" "$destination/xodus-service"
+          touch "$destination/.complete"
+      - name: Build all runtime inputs, packs and APK
+        run: |
+          docker pull docker.io/library/debian:bullseye
+          docker tag docker.io/library/debian:bullseye public.ecr.aws/docker/library/debian:bullseye
+          bash tools/build_local.sh
+      - name: Verify bundled packs and APK
+        run: |
+          python3 tools/release/runtime_inputs.py apk app/build/outputs/apk/debug/app-debug.apk
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import hashlib
+          import io, subprocess, tarfile
+          apk = Path('app/build/outputs/apk/debug/app-debug.apk')
+          with ZipFile(apk) as z:
+              for name in ['proot', 'directaudio', 'tracking', 'xbox', 'comet']:
+                  pack = Path('app/build/packs') / (name + '.tar.zst')
+                  assert hashlib.sha256(z.read('assets/addon-packs/' + pack.name)).digest() == hashlib.sha256(pack.read_bytes()).digest(), name
+                  executable_files = {'proot': ['libproot.so', 'libproot-loader.so'], 'xbox': ['xodus-cli', 'xodus-service']}.get(name, [])
+                  if executable_files:
+                      decoded = subprocess.run(['zstd', '-dc', str(pack)], check=True, stdout=subprocess.PIPE).stdout
+                      with tarfile.open(fileobj=io.BytesIO(decoded)) as archive:
+                          for executable in executable_files:
+                              assert archive.getmember(executable).mode & 0o111, executable
+          Path('SHA256SUMS.txt').write_text(hashlib.sha256(apk.read_bytes()).hexdigest() + '  app-debug.apk\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DroidDeck-0.6.7-PR581-build-results
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/test-results/testDebugUnitTest/
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/runtime-inputs.json
+            SHA256SUMS.txt
+          retention-days: 14
+

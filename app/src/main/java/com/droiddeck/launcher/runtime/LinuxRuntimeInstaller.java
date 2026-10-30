@@ -268,6 +268,13 @@ public final class LinuxRuntimeInstaller {
         // reached verification and failed is not trusted and is removed.
         boolean keepPartial = false;
         try {
+            for (AddonPack pack : new AddonPack[]{AddonPack.PROOT, AddonPack.DIRECTAUDIO}) {
+                if (!pack.getAvailable() && !pack.installed(context)) {
+                    removalError = context.getString(R.string.runtime_pack_missing, pack.getName());
+                    Log.e(TAG, removalError);
+                    return false;
+                }
+            }
             deleteOtherArchives(context.getCacheDir(), archive.getName());
             File pendingRemoval = removalDirectory(LinuxRuntime.rootDir(context));
             if (pendingRemoval.exists() && listener != null) listener.onProgress(context.getString(R.string.rtinst_removing_leftovers), -1);

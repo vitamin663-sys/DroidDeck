@@ -93,7 +93,6 @@ def prootPackPin = rootProject.file('tools/packs/proot/release.env').readLines()
 def addonPacks = ['proot', 'directaudio', 'tracking', 'xbox', 'comet'].collectEntries { name ->
     def pack = file("build/packs/${name}.tar.zst")
     if (!pack.isFile()) {
-        if (ciBuild) throw new GradleException("Add-on pack ${pack} is missing: run tools/packs/build.sh app/build/packs")
         // A source build that did not compile proot still pins a published pack, so the app
         // downloads the patched binary instead of falling back to the rootfs copy.
         if (name == 'proot' && prootPackPin.PROOT_PACK_SHA256) {
@@ -299,8 +298,17 @@ def verifyRuntimeInputs = tasks.register('verifyRuntimeInputs', Exec) {
     workingDir rootProject.projectDir
     commandLine pythonExecutable, 'tools/release/runtime_inputs.py', 'verify'
 }
+
+def verifyAddonPacks = tasks.register('verifyAddonPacks') {
+    doLast {
+        def missing = addonPacks.findAll { name, pack -> !pack.sha256 || pack.size <= 0L }.keySet()
+        if (!missing.isEmpty()) {
+            throw new GradleException("Cannot package an APK without downloadable add-on pack pins: ${missing.join(', ')}. Prepare tools/packs/build.sh app/build/packs, publish matching packs, then rebuild. A fresh installation cannot reuse another app's private packs.")
+        }
+    }
+}
 tasks.configureEach { task ->
-    if (task.name in ['packageDebug', 'packageRelease']) task.dependsOn(verifyRuntimeInputs)
+    if (task.name in ['packageDebug', 'packageRelease']) task.dependsOn(verifyRuntimeInputs, verifyAddonPacks)
 }
 
 def rustCrateDir = layout.projectDirectory.dir('src/main/rust/stores')

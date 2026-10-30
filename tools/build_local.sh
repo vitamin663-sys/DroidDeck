@@ -387,6 +387,12 @@ if ! restore_step comet "${comet_key}" "${comet_out}"; then
     save_step comet "${comet_key}" "${comet_out}"
 fi
 bash tools/packs/build.sh app/build/packs
+if [[ "${DROIDDECK_BUNDLE_PACKS:-0}" == 1 ]]; then
+    mkdir -p app/src/main/assets/addon-packs
+    for name in proot directaudio tracking xbox comet; do
+        cp "app/build/packs/$name.tar.zst" "app/src/main/assets/addon-packs/$name.tar.zst"
+    done
+fi
 python3 tools/release/runtime_inputs.py record
 ./gradlew "${gradle_task}" --console=plain -PndkVersion="${ndk_version}" ${gradle_rust_arg}
 python3 tools/release/check_session_assets.py "app/build/outputs/apk/${build_variant}/app-${build_variant}.apk"

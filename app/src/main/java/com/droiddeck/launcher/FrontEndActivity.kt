@@ -1371,6 +1371,7 @@ class FrontEndActivity : ComponentActivity() {
                             onStickClick = { on -> ControllerPrefs.setStickClick(this, on); refreshController() },
                             onAdaptiveSticks = { on -> ControllerPrefs.setAdaptiveSticks(this, on); refreshController() },
                             onRumble = { on -> ControllerPrefs.setRumble(this, on); refreshController() },
+                            onDeadZone = { v -> ControllerPrefs.setDeadZone(this, v); refreshController() },
                             onSteamButton = { on -> ControllerPrefs.setSteamButton(this, on); refreshController() },
                             onQamButton = { on -> ControllerPrefs.setQamButton(this, on); refreshController() },
                             onKeyboardButton = { on -> ControllerPrefs.setKeyboardButton(this, on); refreshController() },
@@ -1379,6 +1380,12 @@ class FrontEndActivity : ComponentActivity() {
                             onEditLayout = { startActivity(Intent(this, ControllerEditorActivity::class.java)) },
                             onResetLayout = { ControllerPrefs.resetAllLayouts(this); refreshController() },
                             onMapping = { showPerformance = false; showComponents = false; showMapping = true },
+                            onExportReport = {
+                                val message = if (!com.droiddeck.launcher.input.PadBridge.anyControllerConnected()) getString(R.string.ctrl_report_none)
+                                else com.droiddeck.launcher.input.ControllerProfiles.exportReport(this)
+                                    ?.let { getString(R.string.ctrl_report_saved, it.path) } ?: getString(R.string.ctrl_report_failed)
+                                android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
+                            },
                             onResetAll = { ControllerPrefs.resetAll(this); refreshController() },
                         ),
                     ),
@@ -2505,7 +2512,24 @@ class FrontEndActivity : ComponentActivity() {
             return
         }
         if (release == null) {
-            Thread({ checkCatalog() }, "catalog").start()
+            busy = true
+            failed = false
+            stage = getString(R.string.runtime_catalog_checking)
+            percent = -1
+            Thread({
+                val fetched = LinuxRuntimeInstaller.fetchRelease()
+                Log.i(TAG, "runtime install catalog: " + (fetched?.version ?: "unreachable"))
+                ui.post {
+                    busy = false
+                    if (fetched == null) {
+                        failed = true
+                        android.widget.Toast.makeText(this, R.string.runtime_catalog_failed, android.widget.Toast.LENGTH_LONG).show()
+                    } else {
+                        available = fetched
+                        onRuntimeButton()
+                    }
+                }
+            }, "runtime-install-catalog").start()
             return
         }
         if (installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()) { showNonAdreno = release; return }

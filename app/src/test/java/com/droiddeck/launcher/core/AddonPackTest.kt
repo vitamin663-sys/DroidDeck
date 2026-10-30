@@ -42,6 +42,16 @@ class AddonPackTest {
         assertFalse(AddonPack("sample", "", 0L, listOf("tool"), reuseDeviceCopy = true).installed(context))
     }
 
+    @Test fun freshBuildWithoutProotPinReportsPackagingFailureBeforeRuntimeDownload() {
+        org.junit.Assume.assumeFalse(AddonPack.PROOT.available)
+        org.junit.Assume.assumeFalse(AddonPack.PROOT.installed(context))
+        val release = com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.Release(
+            "test", "https://invalid.invalid/runtime.tar.zst", "0".repeat(64), 1L)
+        assertFalse(com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.install(context, release, null))
+        assertEquals(context.getString(com.droiddeck.launcher.R.string.runtime_pack_missing, "proot"),
+            com.droiddeck.launcher.runtime.LinuxRuntimeInstaller.removalError())
+    }
+
     @Test fun pinnedBuildIgnoresOtherInstalledVersions() {
         installed("b".repeat(64))
         val pack = AddonPack("sample", "a".repeat(64), 1L, listOf("tool"))
