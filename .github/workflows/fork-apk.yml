@@ -38,7 +38,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Apply the reviewed 0.6.7 repair
+      - name: Keep the existing PR581 application identity
         run: |
           printf 'droiddeck.debugApplicationIdSuffix=.pr581\n' > local.properties
       - uses: actions/setup-java@v4
@@ -110,4 +110,3 @@ jobs:
             app/build/runtime-inputs.json
             SHA256SUMS.txt
           retention-days: 14
-
