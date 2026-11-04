@@ -414,7 +414,6 @@ public final class PadBridge {
     }
 
     private static boolean hasChordStickInput(float x, float y) {
-        // Back/QAM keeps the legacy neutral threshold independently of game-stick filtering.
         return Math.max(Math.abs(x), Math.abs(y)) >= DEAD_ZONE;
     }
 
@@ -958,14 +957,6 @@ public final class PadBridge {
                 && device.getMotionRange(MotionEvent.AXIS_RZ, event.getSource()) != null;
     }
 
-    public static float rightX(MotionEvent event, boolean wired) {
-        return axis(event, wired ? MotionEvent.AXIS_RX : MotionEvent.AXIS_Z);
-    }
-
-    public static float rightY(MotionEvent event, boolean wired) {
-        return axis(event, wired ? MotionEvent.AXIS_RY : MotionEvent.AXIS_RZ);
-    }
-
     public static float leftTrigger(MotionEvent event, boolean wired) {
         if (wired) return Math.max(0f, Math.min(1f, (event.getAxisValue(MotionEvent.AXIS_Z) + 1f) / 2f));
         float value = event.getAxisValue(MotionEvent.AXIS_LTRIGGER);
@@ -978,8 +969,4 @@ public final class PadBridge {
         return value != 0f ? value : event.getAxisValue(MotionEvent.AXIS_GAS);
     }
 
-    private static float axis(MotionEvent event, int axis) {
-        float value = event.getAxisValue(axis);
-        return Math.abs(value) < DEAD_ZONE ? 0f : value;
-    }
 }
