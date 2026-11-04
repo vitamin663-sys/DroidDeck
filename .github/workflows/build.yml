@@ -21,6 +21,8 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = dbec294583cf74cdb3000ff5a371335082cc148a
           test "$(git rev-parse 'HEAD^{tree}')" = f6daaa13516f7e49da6ee5b7b3e6a72eb2067666
+      - name: Prepare pinned MaliBridge for 0.6.9 unit-test prerequisites
+        run: git submodule update --init external/MaliBridge
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
