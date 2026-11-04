@@ -1,5 +1,5 @@
 name: Verify 0.6.9 stick dead zone
-run-name: Verify 0.6.9 source da0704df and existing features
+run-name: Verify 0.6.9 source 48705975 and existing features
 on:
   push:
     branches: [validation/stick-dead-zone-067]
@@ -17,12 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: da0704df4ddf19c08ceab1a78c438c58550f386b
+          ref: 48705975336c03a4c1e921f3307f2bc9415b7322
           persist-credentials: false
       - name: Verify exact reviewed source
         run: |
-          test "$(git rev-parse HEAD)" = da0704df4ddf19c08ceab1a78c438c58550f386b
-          test "$(git rev-parse 'HEAD^{tree}')" = 33498d998053d5731f1cc7b193c2b82c6e3db8a7
+          test "$(git rev-parse HEAD)" = 48705975336c03a4c1e921f3307f2bc9415b7322
+          test "$(git rev-parse 'HEAD^{tree}')" = bff4bf83b1b5cccd483f8e6d9fdfdda555148029
       - name: Prepare pinned MaliBridge for 0.6.9 unit-test prerequisites
         run: git submodule update --init external/MaliBridge
       - uses: actions/setup-java@v4
