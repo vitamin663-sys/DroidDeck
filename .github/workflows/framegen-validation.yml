@@ -1,0 +1,20 @@
+name: Verify framegen post-upscale
+on:
+  push:
+    branches: [validation/framegen-post-upscale]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/framegen-post-upscale
+          persist-credentials: false
+      - name: Install host Vulkan headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libvulkan-dev
+      - name: Compile and run effects routing and resource lifetime harnesses
+        run: python3 -m unittest discover -s tools/tests -p 'test_effects*.py' -v
