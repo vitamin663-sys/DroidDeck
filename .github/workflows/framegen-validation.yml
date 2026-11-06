@@ -12,9 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a4bae0932aedae6c6f9694cc57811a8c6548ce25
+          ref: c2405d26700c28d282d82c74651b69e94954636a
           persist-credentials: false
       - name: Install host Vulkan headers
         run: sudo apt-get update -qq && sudo apt-get install -y libvulkan-dev
       - name: Compile and run effects routing and resource lifetime harnesses
-        run: python3 -m unittest discover -s tools/tests -p 'test_effects*.py' -v
+        run: |
+          python3 -m unittest discover -s tools/tests -p 'test_effects*.py' -v
+          python3 -m unittest discover -s tools/tests -p 'test_vk_terminal_callers.py' -v
