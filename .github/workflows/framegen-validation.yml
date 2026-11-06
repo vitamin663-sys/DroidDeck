@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: feat/framegen-post-upscale
+          ref: a4bae0932aedae6c6f9694cc57811a8c6548ce25
           persist-credentials: false
       - name: Install host Vulkan headers
         run: sudo apt-get update -qq && sudo apt-get install -y libvulkan-dev
